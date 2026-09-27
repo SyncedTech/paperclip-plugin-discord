@@ -118,7 +118,11 @@ export async function postEmbedWithId(
   token: string,
   channelId: string | number,
   message: DiscordMessage,
-  options: { replyToMessageId?: string } = {},
+  options: {
+    replyToMessageId?: string;
+    /** Discord's `allowed_mentions` object — pass an empty parse list to guarantee a reply never pings anyone. */
+    allowedMentions?: { parse: string[]; replied_user?: boolean };
+  } = {},
 ): Promise<string | null> {
   const safeChannelId = normalizeDiscordPathId(channelId);
   try {
@@ -146,6 +150,7 @@ export async function postEmbedWithId(
                   },
                 }
               : {}),
+            ...(options.allowedMentions ? { allowed_mentions: options.allowedMentions } : {}),
           },
         },
       );

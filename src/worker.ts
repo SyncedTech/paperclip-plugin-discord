@@ -37,7 +37,9 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   humanizePriority,
+  DEFAULT_BASE_URL,
 } from "./formatters.js";
+import { NO_MENTIONS } from "./voice/text-channel-relay.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -2147,17 +2149,27 @@ const plugin = definePlugin({
 
     // --- Mirror agent (and hub-relay) issue comments into the incident thread ---
     //
-    // Paperclip's `issue.comment.created` fires with entityType "issue", entityId
-    // the issue id, and a payload shaped like the created IssueComment (id, body,
-    // authorAgentId, authorUserId, ...) — the same fields
-    // `enrichIssueNotificationPayload` above already reads off `ctx.issues.listComments`.
+    // Paperclip's `issue.comment.created` is built from the activity log
+    // (paperclip server: routes/issues.ts, services/activity-log.ts), NOT from the
+    // comment record itself:
+    //   - `event.actorType`: "agent" | "user" | "system" | "plugin"
+    //   - `event.actorId`: the actor
+    //   - `event.entityId`: the issue id
+    //   - `event.payload`: { commentId, bodySnippet (first 120 chars only),
+    //     identifier, issueTitle, authorizationReason, agentId (acting agent or
+    //     null), runId, responsibleUserId, ... }
+    // There is no `body` and no `authorAgentId` on the event. The full comment
+    // body is fetched separately by `commentId` via `ctx.issues.listComments`
+    // (the SDK has no get-single-comment call) — the relay-prefix check needs
+    // the full text, and `bodySnippet` is truncated to 120 chars.
     //
     // The hub's board key resolves to the consultant's own Paperclip userId, so a
     // hub-authored outcome comment is indistinguishable from a real consultant
-    // reply by author alone. Mirroring is therefore: every agent-authored comment,
-    // PLUS a user/board comment whose body starts with one of the hub's known
-    // outcome prefixes (RELAY_COMMENT_PREFIXES). Everything else — including
-    // Paperclip's own system notices — is left alone.
+    // reply by author alone. Mirroring is therefore: every agent-authored comment
+    // (actorType "agent", falling back to a truthy payload.agentId when actorType
+    // is missing), PLUS a user/board comment whose full body starts with one of
+    // the hub's known outcome prefixes (RELAY_COMMENT_PREFIXES). Everything else
+    // — including Paperclip's own system notices — is left alone.
     ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.mirrorAgentComments) return;
@@ -2170,20 +2182,21 @@ const plugin = definePlugin({
       if (!issueId) return;
 
       const payload = event.payload as {
-        body?: unknown;
-        authorAgentId?: unknown;
+        commentId?: unknown;
+        agentId?: unknown;
       };
-      const body = typeof payload.body === "string" ? payload.body.trim() : "";
-      if (!body) return;
-
-      const isAgentComment = typeof payload.authorAgentId === "string" && payload.authorAgentId.length > 0;
-      const isRelayComment = !isAgentComment && RELAY_COMMENT_PREFIXES.some((prefix) => body.startsWith(prefix));
-      if (!isAgentComment && !isRelayComment) {
-        ctx.logger.debug("Skipping issue comment for Discord mirror: not agent-authored or a known relay prefix", {
+      const commentId = typeof payload.commentId === "string" ? payload.commentId : null;
+      if (!commentId) {
+        ctx.logger.debug("issue.comment.created payload has no commentId; skipping Discord comment mirror", {
           issueId,
         });
         return;
       }
+
+      const actorType = typeof event.actorType === "string" ? event.actorType : null;
+      const isAgentComment =
+        actorType === "agent" ||
+        (actorType == null && typeof payload.agentId === "string" && payload.agentId.length > 0);
 
       const stored = (await ctx.state.get({
         scopeKind: "instance",
@@ -2198,8 +2211,40 @@ const plugin = definePlugin({
         return;
       }
 
-      const base = trimToNull(rt.baseUrl);
-      const issueUrl = base ? `${base.replace(/\/$/, "")}/issues/${issueId}` : null;
+      let body = "";
+      try {
+        const comments = await ctx.issues.listComments(issueId, rt.companyId);
+        const comment = (comments as Array<{ id: string; body: string }>).find((c) => c.id === commentId);
+        if (!comment) {
+          ctx.logger.debug("Comment not found while mirroring to Discord", { issueId, commentId });
+          return;
+        }
+        body = comment.body.trim();
+      } catch (err) {
+        ctx.logger.debug("Failed to fetch comment body for Discord mirror", {
+          issueId,
+          commentId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      if (!body) {
+        ctx.logger.debug("Comment body is empty; skipping Discord comment mirror", { issueId, commentId });
+        return;
+      }
+
+      const isRelayComment = !isAgentComment && RELAY_COMMENT_PREFIXES.some((prefix) => body.startsWith(prefix));
+      if (!isAgentComment && !isRelayComment) {
+        ctx.logger.debug("Skipping issue comment for Discord mirror: not agent-authored or a known relay prefix", {
+          issueId,
+          commentId,
+        });
+        return;
+      }
+
+      const base = (trimToNull(rt.baseUrl) ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+      const issueUrl = `${base}/issues/${issueId}`;
       const content = clipMirrorContent(body, issueUrl);
 
       await postEmbedWithId(
@@ -2207,7 +2252,10 @@ const plugin = definePlugin({
         rt.token,
         stored.channelId,
         { content },
-        { replyToMessageId: stored.messageId },
+        {
+          replyToMessageId: stored.messageId,
+          allowedMentions: { ...NO_MENTIONS, replied_user: false },
+        },
       );
     });
 

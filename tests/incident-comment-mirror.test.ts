@@ -151,16 +151,58 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   return { ctx, eventHandlers, getDiscordMessageCount: () => discordMessageCount, mockDiscordFetch };
 }
 
-function makeEvent(eventType: string, eventId: string, payload: Record<string, unknown> = {}, entityId = "issue-1"): any {
+function makeEvent(
+  eventType: string,
+  eventId: string,
+  payload: Record<string, unknown> = {},
+  opts: { entityId?: string; actorType?: "user" | "agent" | "system" | "plugin"; actorId?: string } = {},
+): any {
   return {
     eventId,
     eventType,
     occurredAt: new Date().toISOString(),
     companyId: TEST_COMPANY_ID,
-    entityId,
+    entityId: opts.entityId ?? "issue-1",
     entityType: "issue",
+    actorType: opts.actorType,
+    actorId: opts.actorId,
     payload,
   };
+}
+
+/**
+ * A real `issue.comment.created` event, matching what the Paperclip server
+ * actually sends (routes/issues.ts + services/activity-log.ts): built from the
+ * activity log, so `actorType`/`actorId` carry the author and the payload is a
+ * summary — `commentId` + a 120-char `bodySnippet` — never the full `body`.
+ * The plugin fetches the full comment separately via `commentId`.
+ */
+function makeCommentEvent(
+  eventId: string,
+  opts: {
+    commentId: string;
+    actorType?: "user" | "agent" | "system" | "plugin";
+    agentId?: string | null;
+    bodySnippet?: string;
+    entityId?: string;
+    extraPayload?: Record<string, unknown>;
+  },
+): any {
+  return makeEvent(
+    "issue.comment.created",
+    eventId,
+    {
+      commentId: opts.commentId,
+      bodySnippet: opts.bodySnippet ?? "",
+      identifier: "INC-1",
+      issueTitle: "Something broke",
+      agentId: opts.agentId ?? null,
+      runId: null,
+      responsibleUserId: null,
+      ...opts.extraPayload,
+    },
+    { entityId: opts.entityId, actorType: opts.actorType },
+  );
 }
 
 async function emitEvent(
@@ -189,18 +231,24 @@ function findMessageCreateCalls(mockDiscordFetch: ReturnType<typeof vi.fn>) {
 }
 
 describe("issue.comment.created: mirroring agent and hub-relay comments into the incident thread", () => {
-  it("mirrors an agent-authored comment as a reply to the stored incident message", async () => {
+  it("mirrors an agent-authored comment as a reply to the stored incident message, with mentions suppressed", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([
+      { id: "c1", body: "Root cause: the healthcheck flapped because of a DNS timeout." },
+    ]);
     await getSetup()(ctx);
     await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
 
-    const event = makeEvent("issue.comment.created", "evt-comment-1", {
-      body: "Root cause: the healthcheck flapped because of a DNS timeout.",
-      authorAgentId: "agent-oncall",
+    const event = makeCommentEvent("evt-comment-1", {
+      commentId: "c1",
+      actorType: "agent",
+      agentId: "agent-oncall",
+      bodySnippet: "Root cause: the healthcheck flapped becaus",
     });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
 
+    expect(ctx.issues.listComments).toHaveBeenCalledWith("issue-1", TEST_COMPANY_ID);
     const calls = findMessageCreateCalls(mockDiscordFetch);
     expect(calls).toHaveLength(1);
     expect(calls[0][0]).toContain("/channels/ch-incidents/messages");
@@ -208,16 +256,36 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
     expect(body.message_reference).toMatchObject({ message_id: "msg-original" });
     expect(body.content).toContain("Root cause: the healthcheck flapped");
     expect(body.content).toContain("https://paperclip.example.com/issues/issue-1");
+    expect(body.allowed_mentions).toEqual({ parse: [], replied_user: false });
   });
 
-  it("mirrors a board/user comment only when it starts with a known hub relay prefix", async () => {
+  it("treats a missing actorType with a truthy payload.agentId as agent-authored", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([{ id: "c2", body: "Fallback-detected agent comment." }]);
     await getSetup()(ctx);
     await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
 
-    const event = makeEvent("issue.comment.created", "evt-comment-2", {
-      body: "Approved by the consultant and run on host-1: systemctl restart nginx",
-      authorUserId: "consultant-user-id",
+    const event = makeCommentEvent("evt-comment-1b", { commentId: "c2", agentId: "agent-oncall" });
+    // No actorType set at all — only the payload.agentId fallback should mark this as agent-authored.
+    delete event.actorType;
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    expect(findMessageCreateCalls(mockDiscordFetch)).toHaveLength(1);
+  });
+
+  it("mirrors a board/user comment only when its full body starts with a known hub relay prefix", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([
+      { id: "c3", body: "Approved by the consultant and run on host-1: systemctl restart nginx" },
+    ]);
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-2", {
+      commentId: "c3",
+      actorType: "user",
+      bodySnippet: "Approved by the consultant and run on host-1:",
     });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
@@ -228,15 +296,43 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
     expect(body.content).toContain("Approved by the consultant");
   });
 
-  it("skips a Paperclip system notice (no relay prefix, not agent-authored)", async () => {
+  it("reads the comment body via commentId, never the old assumed payload.body field", async () => {
+    // Regression guard: an earlier draft assumed the event payload carried `body`
+    // and `authorAgentId` directly. It does not — the event is an activity-log
+    // summary. A payload that happens to still have a `body` key (e.g. a stale
+    // caller) must be ignored in favour of the fetched comment.
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([
+      { id: "c4", body: "Real body from listComments, this is what should be posted." },
+    ]);
     await getSetup()(ctx);
     await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
 
-    const event = makeEvent("issue.comment.created", "evt-comment-3", {
-      body: "This issue needs a disposition before it can proceed.",
-      authorUserId: "consultant-user-id",
+    const event = makeCommentEvent("evt-comment-old-shape", {
+      commentId: "c4",
+      actorType: "agent",
+      agentId: "agent-oncall",
+      extraPayload: { body: "OLD SHAPE BODY - must not be used", authorAgentId: "agent-oncall" },
     });
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    const calls = findMessageCreateCalls(mockDiscordFetch);
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0][1].body);
+    expect(body.content).toContain("Real body from listComments");
+    expect(body.content).not.toContain("OLD SHAPE BODY");
+  });
+
+  it("skips a Paperclip system notice (no relay prefix, not agent-authored)", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([
+      { id: "c5", body: "This issue needs a disposition before it can proceed." },
+    ]);
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-3", { commentId: "c5", actorType: "system" });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
 
@@ -252,10 +348,7 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
     await getSetup()(ctx);
     // No seedIncidentMessage call: this issue predates the plugin restart.
 
-    const event = makeEvent("issue.comment.created", "evt-comment-4", {
-      body: "Root cause found.",
-      authorAgentId: "agent-oncall",
-    });
+    const event = makeCommentEvent("evt-comment-4", { commentId: "c6", actorType: "agent", agentId: "agent-oncall" });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
 
@@ -266,15 +359,64 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
     );
   });
 
-  it("does nothing when mirrorAgentComments is off", async () => {
-    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({ mirrorAgentComments: false });
+  it("debug-logs and skips when the fetched comment body is empty", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([{ id: "c7", body: "   " }]);
     await getSetup()(ctx);
     await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
 
-    const event = makeEvent("issue.comment.created", "evt-comment-5", {
-      body: "Root cause found.",
-      authorAgentId: "agent-oncall",
-    });
+    const event = makeCommentEvent("evt-comment-empty", { commentId: "c7", actorType: "agent", agentId: "agent-oncall" });
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    expect(findMessageCreateCalls(mockDiscordFetch)).toHaveLength(0);
+    expect(ctx.logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("Comment body is empty"),
+      expect.anything(),
+    );
+  });
+
+  it("debug-logs and skips when the comment id isn't found in listComments", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockResolvedValue([{ id: "some-other-comment", body: "unrelated" }]);
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-missing", { commentId: "c8", actorType: "agent", agentId: "agent-oncall" });
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    expect(findMessageCreateCalls(mockDiscordFetch)).toHaveLength(0);
+    expect(ctx.logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("Comment not found"),
+      expect.anything(),
+    );
+  });
+
+  it("debug-logs and skips when fetching comments throws", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    ctx.issues.listComments.mockRejectedValue(new Error("board api unavailable"));
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-fetch-fail", { commentId: "c9", actorType: "agent", agentId: "agent-oncall" });
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    expect(findMessageCreateCalls(mockDiscordFetch)).toHaveLength(0);
+    expect(ctx.logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to fetch comment body"),
+      expect.anything(),
+    );
+  });
+
+  it("does nothing when mirrorAgentComments is off", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({ mirrorAgentComments: false });
+    ctx.issues.listComments.mockResolvedValue([{ id: "c10", body: "Root cause found." }]);
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-5", { commentId: "c10", actorType: "agent", agentId: "agent-oncall" });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
 
@@ -283,16 +425,13 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
 
   it("clips a long comment to 2000 chars, keeping the first line and ending with the issue link", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    const firstLine = "Root cause: the disk filled up on host-3.";
+    const longBody = `${firstLine}\n${"filler line describing background context.\n".repeat(100)}`;
+    ctx.issues.listComments.mockResolvedValue([{ id: "c11", body: longBody }]);
     await getSetup()(ctx);
     await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
 
-    const firstLine = "Root cause: the disk filled up on host-3.";
-    const longBody = `${firstLine}\n${"filler line describing background context.\n".repeat(100)}`;
-
-    const event = makeEvent("issue.comment.created", "evt-comment-6", {
-      body: longBody,
-      authorAgentId: "agent-oncall",
-    });
+    const event = makeCommentEvent("evt-comment-6", { commentId: "c11", actorType: "agent", agentId: "agent-oncall" });
 
     await emitEvent(eventHandlers, "issue.comment.created", event);
 
@@ -301,6 +440,21 @@ describe("issue.comment.created: mirroring agent and hub-relay comments into the
     expect(body.content.length).toBeLessThanOrEqual(2000);
     expect(body.content.startsWith(firstLine)).toBe(true);
     expect(body.content.endsWith("https://paperclip.example.com/issues/issue-1")).toBe(true);
+  });
+
+  it("falls back to the default base URL when paperclipBaseUrl is empty, so the link is always there", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({ paperclipBaseUrl: "" });
+    ctx.issues.listComments.mockResolvedValue([{ id: "c12", body: "Root cause found." }]);
+    await getSetup()(ctx);
+    await seedIncidentMessage(ctx, "issue-1", "ch-incidents", "msg-original");
+
+    const event = makeCommentEvent("evt-comment-7", { commentId: "c12", actorType: "agent", agentId: "agent-oncall" });
+
+    await emitEvent(eventHandlers, "issue.comment.created", event);
+
+    const calls = findMessageCreateCalls(mockDiscordFetch);
+    const body = JSON.parse(calls[0][1].body);
+    expect(body.content).toContain("http://localhost:3100/issues/issue-1");
   });
 });
 

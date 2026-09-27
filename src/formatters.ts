@@ -4,7 +4,7 @@ import { COLORS } from "./constants.js";
 
 type Payload = Record<string, unknown>;
 
-const DEFAULT_BASE_URL = "http://localhost:3100";
+export const DEFAULT_BASE_URL = "http://localhost:3100";
 
 const STATUS_LABELS: Record<string, string> = {
   todo: "To Do",
