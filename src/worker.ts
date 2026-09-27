@@ -6,7 +6,17 @@ import {
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
-import { DEFAULT_CONFIG, COLORS, METRIC_NAMES, PLUGIN_ID, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX, BUDGET_ALERT_THRESHOLD } from "./constants.js";
+import {
+  DEFAULT_CONFIG,
+  COLORS,
+  METRIC_NAMES,
+  PLUGIN_ID,
+  WEBHOOK_KEYS,
+  ACP_PLUGIN_EVENT_PREFIX,
+  BUDGET_ALERT_THRESHOLD,
+  RELAY_COMMENT_PREFIXES,
+  DISCORD_MESSAGE_CONTENT_LIMIT,
+} from "./constants.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import {
   postEmbed,
@@ -81,6 +91,14 @@ type DiscordConfig = {
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
+  /** Off suppresses agent.run.started/finished posts entirely. Default true (unchanged upstream behaviour). */
+  notifyOnRunEvents: boolean;
+  /**
+   * Mirror agent-authored issue comments — and the hub's allow-listed
+   * approval/close-outcome comments — into the incident's Discord thread.
+   * Default false: purely additive, opt-in behaviour.
+   */
+  mirrorAgentComments: boolean;
   enableIntelligence: boolean;
   intelligenceChannelIds: string[];
   backfillDays: number;
@@ -767,6 +785,29 @@ type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected" | "stal
 /** State key holding what a text channel is currently about, for voice routing. */
 function voiceTargetKey(channelId: string): string {
   return `voice_target_${channelId}`;
+}
+
+/** State key holding the bot's original incident message for one issue, for comment mirroring. */
+function issueMessageKey(issueId: string): string {
+  return `issue_message_${issueId}`;
+}
+
+/**
+ * Clip mirrored comment text to Discord's message content limit, keeping the
+ * first lines (the instructions put the finding first) and always ending with
+ * the link to the issue in Paperclip.
+ */
+export function clipMirrorContent(body: string, issueUrl: string | null): string {
+  const link = issueUrl ? `\n\n${issueUrl}` : "";
+  const budget = DISCORD_MESSAGE_CONTENT_LIMIT - link.length;
+  if (body.length <= budget) return body + link;
+
+  let clipped = body.slice(0, Math.max(0, budget));
+  const lastNewline = clipped.lastIndexOf("\n");
+  // Prefer to cut on a line boundary so the kept text isn't a mid-sentence
+  // fragment; only hard-cut when there is no earlier newline to fall back to.
+  if (lastNewline > 0) clipped = clipped.slice(0, lastNewline);
+  return clipped + link;
 }
 
 /** Trim a configured string to null when it carries nothing. */
@@ -1967,7 +2008,26 @@ const plugin = definePlugin({
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnIssueCreated) return;
       const payload = await enrichIssueNotificationPayload(ctx, event);
-      await notify(ctx, rt, { ...event, payload }, formatIssueCreated);
+      await notify(
+        ctx,
+        rt,
+        { ...event, payload },
+        formatIssueCreated,
+        undefined,
+        undefined,
+        async (channelId, messageId) => {
+          // Remembered so a later issue.comment.created can reply under THIS
+          // message, putting the whole incident story in one thread. Keyed by
+          // issue id, distinct from notify()'s own `msg_*` reverse mapping
+          // (channel+message -> entity), which serves inbound reply routing.
+          if (event.entityId) {
+            await ctx.state.set(
+              { scopeKind: "instance", stateKey: issueMessageKey(event.entityId) },
+              { channelId, messageId },
+            );
+          }
+        },
+      );
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
@@ -2074,15 +2134,81 @@ const plugin = definePlugin({
 
     ctx.events.on("agent.run.started", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
-      if (!rt) return;
+      if (!rt || !rt.config.notifyOnRunEvents) return;
       const payload = await enrichRunPayload(ctx, event);
       await notify(ctx, rt, { ...event, payload }, formatAgentRunStarted, rt.bdPipelineChannelId ?? undefined);
     });
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
-      if (!rt) return;
+      if (!rt || !rt.config.notifyOnRunEvents) return;
       const payload = await enrichRunPayload(ctx, event);
       await notify(ctx, rt, { ...event, payload }, formatAgentRunFinished, rt.bdPipelineChannelId ?? undefined);
+    });
+
+    // --- Mirror agent (and hub-relay) issue comments into the incident thread ---
+    //
+    // Paperclip's `issue.comment.created` fires with entityType "issue", entityId
+    // the issue id, and a payload shaped like the created IssueComment (id, body,
+    // authorAgentId, authorUserId, ...) — the same fields
+    // `enrichIssueNotificationPayload` above already reads off `ctx.issues.listComments`.
+    //
+    // The hub's board key resolves to the consultant's own Paperclip userId, so a
+    // hub-authored outcome comment is indistinguishable from a real consultant
+    // reply by author alone. Mirroring is therefore: every agent-authored comment,
+    // PLUS a user/board comment whose body starts with one of the hub's known
+    // outcome prefixes (RELAY_COMMENT_PREFIXES). Everything else — including
+    // Paperclip's own system notices — is left alone.
+    ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.config.mirrorAgentComments) return;
+      if (isDuplicate(event.eventId)) {
+        ctx.logger.debug(`Skipping duplicate event ${event.eventType} (${event.eventId})`);
+        return;
+      }
+
+      const issueId = event.entityId;
+      if (!issueId) return;
+
+      const payload = event.payload as {
+        body?: unknown;
+        authorAgentId?: unknown;
+      };
+      const body = typeof payload.body === "string" ? payload.body.trim() : "";
+      if (!body) return;
+
+      const isAgentComment = typeof payload.authorAgentId === "string" && payload.authorAgentId.length > 0;
+      const isRelayComment = !isAgentComment && RELAY_COMMENT_PREFIXES.some((prefix) => body.startsWith(prefix));
+      if (!isAgentComment && !isRelayComment) {
+        ctx.logger.debug("Skipping issue comment for Discord mirror: not agent-authored or a known relay prefix", {
+          issueId,
+        });
+        return;
+      }
+
+      const stored = (await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: issueMessageKey(issueId),
+      })) as { channelId: string; messageId: string } | null;
+      if (!stored) {
+        // Nothing recorded for this issue — e.g. it was created before this
+        // plugin instance started. Never guess a channel: skip silently.
+        ctx.logger.debug("No stored incident message for issue; skipping Discord comment mirror", {
+          issueId,
+        });
+        return;
+      }
+
+      const base = trimToNull(rt.baseUrl);
+      const issueUrl = base ? `${base.replace(/\/$/, "")}/issues/${issueId}` : null;
+      const content = clipMirrorContent(body, issueUrl);
+
+      await postEmbedWithId(
+        ctx,
+        rt.token,
+        stored.channelId,
+        { content },
+        { replyToMessageId: stored.messageId },
+      );
     });
 
     // ===================================================================

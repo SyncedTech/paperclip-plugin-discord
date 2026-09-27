@@ -137,6 +137,20 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Notify on agent error",
         default: DEFAULT_CONFIG.notifyOnAgentError,
       },
+      notifyOnRunEvents: {
+        type: "boolean",
+        title: "Notify on agent run started/finished",
+        description:
+          "Post Run Started/Finished messages for agent.run.* events. Turn off to keep the pipeline channel quiet while still mirroring agent comments into incident threads.",
+        default: DEFAULT_CONFIG.notifyOnRunEvents,
+      },
+      mirrorAgentComments: {
+        type: "boolean",
+        title: "Mirror agent comments into incident threads",
+        description:
+          "Reply, under the bot's original incident message, with every agent-authored issue comment plus the hub's own allow-listed approval/close-outcome comments, so the incident's Discord thread shows the whole story. Skips everything else, including Paperclip's own system notices.",
+        default: DEFAULT_CONFIG.mirrorAgentComments,
+      },
       enableIntelligence: {
         type: "boolean",
         title: "Enable community intelligence",

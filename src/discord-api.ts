@@ -118,6 +118,7 @@ export async function postEmbedWithId(
   token: string,
   channelId: string | number,
   message: DiscordMessage,
+  options: { replyToMessageId?: string } = {},
 ): Promise<string | null> {
   const safeChannelId = normalizeDiscordPathId(channelId);
   try {
@@ -133,6 +134,18 @@ export async function postEmbedWithId(
             content: message.content,
             embeds: message.embeds,
             components: message.components,
+            // Renders the message as a reply under the original incident message,
+            // in the same channel. `fail_if_not_exists: false` degrades to a plain
+            // (non-reply) post rather than throwing when the referenced message was
+            // deleted out from under us.
+            ...(options.replyToMessageId
+              ? {
+                  message_reference: {
+                    message_id: options.replyToMessageId,
+                    fail_if_not_exists: false,
+                  },
+                }
+              : {}),
           },
         },
       );

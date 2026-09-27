@@ -29,6 +29,8 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
   notifyOnAgentError: true,
+  notifyOnRunEvents: true,
+  mirrorAgentComments: false,
   enableIntelligence: false,
   intelligenceChannelIds: [] as string[],
   escalationChannelId: "",
@@ -51,6 +53,42 @@ export const DEFAULT_CONFIG = {
 } as const;
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
+
+/**
+ * Discord's hard limit on a message's `content` field. A mirrored comment is
+ * clipped to this, keeping its first lines and ending with the Paperclip link
+ * (see `clipMirrorContent` in worker.ts).
+ */
+export const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
+
+/**
+ * Exact-prefix allowlist for mirroring a non-agent (user/board) issue comment
+ * into its Discord thread.
+ *
+ * The hub's board key resolves to the consultant's own Paperclip userId, so
+ * the plugin cannot distinguish a hub-authored outcome comment from a real
+ * consultant reply by author alone — every hub comment arrives as a plain
+ * board/user comment (`authorAgentId` unset). Mirroring is therefore keyed on
+ * the comment body starting with one of these hub-authored outcome texts
+ * (confirmed against packages/hub/src/{relay.ts,incidents.ts,docs-pr.ts} in
+ * the synced-oncall-plan3-build repo). A board comment that is not one of
+ * these — including Paperclip's own system notices ("needs a disposition",
+ * liveness) — is never mirrored.
+ */
+export const RELAY_COMMENT_PREFIXES = [
+  "Recovered on its own:",
+  "Cleared:",
+  "Approved by the consultant",
+  "Approved, but",
+  "The command on",
+  "The approval expired",
+  "The approval for the command on",
+  "The consultant rejected",
+  "The consultant cancelled",
+  "Docs PR opened:",
+  "Docs PR updated:",
+  "Docs PR failed:",
+] as const;
 
 export const COLORS = {
   BLUE: 0x5865f2,
